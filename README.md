@@ -14,14 +14,16 @@ Builds for Linux, Windows and macOS are attached to every release:
 
 <https://github.com/LynxbyAI/lynxby-desktop/releases/latest>
 
-The file is the app: unzip it somewhere you can run from and start it. There is no
-installer, no code signing and no update feed yet. Each build prints its platform in
+The file is the app: download the one for your platform and start it. On Linux and
+macOS, make it executable first (`chmod +x`). There is no installer, no code signing
+and no update feed yet, so macOS may block it the first time; allow it under
+System Settings › Privacy & Security. Each build prints its platform in
 the footer of the sign-in screen.
 
 ## Run it
 
 ```sh
-# ddev (the default in a debug build)
+# local development deployment (the default in a debug build)
 cargo run
 
 # production
@@ -101,7 +103,7 @@ cargo test -- --ignored        # needs LYNXBY_TEST_BASE_URL, talks to a deployme
 ```
 
 ```sh
-LYNXBY_TEST_BASE_URL=https://projectsovereign.ddev.site \
+LYNXBY_TEST_BASE_URL=https://your-deployment.example \
   cargo test -p lynxby-client --test ddev -- --ignored --nocapture
 ```
 
@@ -122,9 +124,9 @@ The screens only render; they never call the network.
 
 ## Where this comes from
 
-The client was developed inside the platform repository and moved here when it
-started shipping as an app. The platform, its API and its docs live in
-[ProjectSovereign](https://github.com/LynxbyAI/ProjectSovereign).
+The client was developed inside the Lynxby platform repository, which is private,
+and moved here when it started shipping as an app. The public API clients live in
+[lynxby-sdk](https://github.com/LynxbyAI/lynxby-sdk).
 
 ## Not built yet
 
