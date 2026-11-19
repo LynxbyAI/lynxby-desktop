@@ -28,11 +28,11 @@ disk image and drag Lynxby to Applications. Windows: run the setup, or the
 standalone executable.
 
 macOS builds are signed with a Developer ID certificate, notarised and stapled, so
-Gatekeeper lets them through. Windows builds carry a signature when the repository
-has a signing certificate, though SmartScreen can still warn until a download has
-reputation. A fork without the signing secrets still builds: the log shows a
-warning and the build is unsigned. Each build prints its platform in the footer of
-the sign-in screen.
+Gatekeeper lets them through. Windows builds are signed with Azure Artifact Signing
+when the repository is set up for it, though SmartScreen can still warn until a
+download has reputation. A fork without the signing configuration still builds: the
+log shows a warning and the build is unsigned. Each build prints its platform in the
+footer of the sign-in screen.
 
 ## Run it
 
@@ -105,12 +105,16 @@ release build.
   executable for Windows, and a signed, notarised disk image for macOS.
 - Pushing a tag that starts with `v` publishes those packages as a release, with a
   `SHA256SUMS` file next to them.
-- Signing reads its secrets from the repository: `MACOS_CERT_P12`,
-  `MACOS_CERT_PASSWORD` (a base64 Developer ID Application `.p12`),
-  `MACOS_SIGN_IDENTITY` (optional, otherwise read from the `.p12`), `APPLE_ID`,
-  `APPLE_TEAM_ID` and `APPLE_APP_PASSWORD` for macOS; `WINDOWS_CERT_P12` and
-  `WINDOWS_CERT_PASSWORD` (a base64 code signing `.pfx`) for Windows. A missing
-  secret skips that step with a warning, so unsigned builds keep working.
+- Signing reads its configuration from the repository, and
+  [docs/signing-setup.md](docs/signing-setup.md) lists the one-time setup for both.
+  macOS: `MACOS_CERT_P12`, `MACOS_CERT_PASSWORD` (a base64 Developer ID Application
+  `.p12`), `MACOS_SIGN_IDENTITY` (optional, otherwise read from the `.p12`),
+  `APPLE_ID`, `APPLE_TEAM_ID` and `APPLE_APP_PASSWORD`. Windows: the secrets
+  `AZURE_TENANT_ID`, `AZURE_CLIENT_ID` and `AZURE_SUBSCRIPTION_ID` for an app
+  registration that signs in over OIDC, and the variables
+  `ARTIFACT_SIGNING_ENDPOINT`, `ARTIFACT_SIGNING_ACCOUNT` and
+  `ARTIFACT_SIGNING_PROFILE` for the Azure Artifact Signing certificate profile. A
+  missing value skips that step with a warning, so unsigned builds keep working.
 
 ```sh
 git tag v0.1.0 && git push origin v0.1.0

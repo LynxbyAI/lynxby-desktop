@@ -4,12 +4,20 @@ name: Build
 # packaged builds as a release, which is where the download links on lynxby.com
 # point.
 #
-# Signing is optional: a missing secret skips that step with a warning, so
-# unsigned builds keep working. Secrets, all read in the build job:
+# Signing is optional: missing signing configuration skips that step with a
+# warning, so unsigned builds keep working. Secrets and variables, all read in
+# the build job:
 #   MACOS_CERT_P12, MACOS_CERT_PASSWORD   Developer ID Application .p12, base64
 #   MACOS_SIGN_IDENTITY                   optional, otherwise taken from the p12
 #   APPLE_ID, APPLE_TEAM_ID, APPLE_APP_PASSWORD   notarytool credentials
-#   WINDOWS_CERT_P12, WINDOWS_CERT_PASSWORD       code signing .pfx, base64
+#   AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_SUBSCRIPTION_ID
+#                                         app registration with a federated
+#                                         credential, so azure/login uses OIDC
+#   ARTIFACT_SIGNING_ENDPOINT             variable, for example
+#                                         https://weu.codesigning.azure.net
+#   ARTIFACT_SIGNING_ACCOUNT              variable, Artifact Signing account
+#   ARTIFACT_SIGNING_PROFILE              variable, certificate profile
+# The one-time setup on both sides is in docs/signing-setup.md.
 
 on:
   push:
@@ -60,6 +68,9 @@ jobs:
   build:
     name: ${{ matrix.platform }}
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      id-token: write
 
     strategy:
       fail-fast: false
@@ -82,8 +93,13 @@ jobs:
       APPLE_ID: ${{ secrets.APPLE_ID }}
       APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
       APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
-      WINDOWS_CERT_P12: ${{ secrets.WINDOWS_CERT_P12 }}
-      WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      ARTIFACT_SIGNING_ENDPOINT: ${{ vars.ARTIFACT_SIGNING_ENDPOINT }}
+      ARTIFACT_SIGNING_ACCOUNT: ${{ vars.ARTIFACT_SIGNING_ACCOUNT }}
+      ARTIFACT_SIGNING_PROFILE: ${{ vars.ARTIFACT_SIGNING_PROFILE }}
+      WINDOWS_SIGNING_ENABLED: ${{ vars.ARTIFACT_SIGNING_ENDPOINT != '' && vars.ARTIFACT_SIGNING_ACCOUNT != '' && vars.ARTIFACT_SIGNING_PROFILE != '' }}
 
     steps:
       - uses: actions/checkout@v4
@@ -217,29 +233,38 @@ jobs:
         run: echo "::warning title=Unnotarised macOS build::APPLE_ID, APPLE_TEAM_ID or APPLE_APP_PASSWORD is not set, so the signed disk image is not notarised and Gatekeeper warns on first open."
 
       - name: Unsigned Windows build
-        if: runner.os == 'Windows' && env.WINDOWS_CERT_P12 == ''
-        run: echo "::warning title=Unsigned Windows build::WINDOWS_CERT_P12 is not set, so the executable and installer are unsigned and SmartScreen warns on first open."
+        if: runner.os == 'Windows' && env.WINDOWS_SIGNING_ENABLED != 'true'
+        run: echo "::warning title=Unsigned Windows build::ARTIFACT_SIGNING_ENDPOINT, ARTIFACT_SIGNING_ACCOUNT or ARTIFACT_SIGNING_PROFILE is not set, so the executable and installer are unsigned and SmartScreen warns on first open."
 
-      - name: Import the Windows certificate
-        if: runner.os == 'Windows' && env.WINDOWS_CERT_P12 != ''
-        shell: pwsh
-        run: |
-          $path = Join-Path $env:RUNNER_TEMP 'codesign.pfx'
-          [IO.File]::WriteAllBytes($path, [Convert]::FromBase64String($env:WINDOWS_CERT_P12))
-          "WINDOWS_CERT_PATH=$path" | Out-File -FilePath $env:GITHUB_ENV -Append
+      - name: Azure login
+        if: runner.os == 'Windows' && env.WINDOWS_SIGNING_ENABLED == 'true'
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
       - name: Sign the executable
-        if: runner.os == 'Windows' && env.WINDOWS_CERT_P12 != ''
-        shell: pwsh
-        run: |
-          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" |
-            Sort-Object FullName -Descending | Select-Object -First 1
-          if (-not $signtool) { throw 'signtool.exe not found' }
-          & $signtool.FullName sign /fd SHA256 /f $env:WINDOWS_CERT_PATH /p $env:WINDOWS_CERT_PASSWORD `
-            /tr https://timestamp.digicert.com /td SHA256 target/release/lynxby-desktop.exe
-          if ($LASTEXITCODE -ne 0) { throw 'signing the executable failed' }
-          & $signtool.FullName verify /pa /v target/release/lynxby-desktop.exe
-          if ($LASTEXITCODE -ne 0) { throw 'verifying the executable failed' }
+        if: runner.os == 'Windows' && env.WINDOWS_SIGNING_ENABLED == 'true'
+        uses: azure/artifact-signing-action@v2
+        with:
+          endpoint: ${{ env.ARTIFACT_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ env.ARTIFACT_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ env.ARTIFACT_SIGNING_PROFILE }}
+          files: ${{ github.workspace }}\target\release\lynxby-desktop.exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+          exclude-environment-credential: true
+          exclude-workload-identity-credential: true
+          exclude-managed-identity-credential: true
+          exclude-shared-token-cache-credential: true
+          exclude-visual-studio-credential: true
+          exclude-visual-studio-code-credential: true
+          exclude-azure-cli-credential: false
+          exclude-azure-powershell-credential: true
+          exclude-azure-developer-cli-credential: true
+          exclude-interactive-browser-credential: true
 
       - name: Build the installer
         if: runner.os == 'Windows'
@@ -260,15 +285,26 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'building the installer failed' }
 
       - name: Sign the installer
-        if: runner.os == 'Windows' && env.WINDOWS_CERT_P12 != ''
-        shell: pwsh
-        run: |
-          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" |
-            Sort-Object FullName -Descending | Select-Object -First 1
-          if (-not $signtool) { throw 'signtool.exe not found' }
-          & $signtool.FullName sign /fd SHA256 /f $env:WINDOWS_CERT_PATH /p $env:WINDOWS_CERT_PASSWORD `
-            /tr https://timestamp.digicert.com /td SHA256 dist/lynxby-desktop-windows-x86_64-setup.exe
-          if ($LASTEXITCODE -ne 0) { throw 'signing the installer failed' }
+        if: runner.os == 'Windows' && env.WINDOWS_SIGNING_ENABLED == 'true'
+        uses: azure/artifact-signing-action@v2
+        with:
+          endpoint: ${{ env.ARTIFACT_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ env.ARTIFACT_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ env.ARTIFACT_SIGNING_PROFILE }}
+          files: ${{ github.workspace }}\dist\lynxby-desktop-windows-x86_64-setup.exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+          exclude-environment-credential: true
+          exclude-workload-identity-credential: true
+          exclude-managed-identity-credential: true
+          exclude-shared-token-cache-credential: true
+          exclude-visual-studio-credential: true
+          exclude-visual-studio-code-credential: true
+          exclude-azure-cli-credential: false
+          exclude-azure-powershell-credential: true
+          exclude-azure-developer-cli-credential: true
+          exclude-interactive-browser-credential: true
 
       - name: Collect the assets
         if: runner.os == 'Windows'
