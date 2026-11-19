@@ -1,7 +1,15 @@
 name: Build
 
-# Checking happens on every push and pull request. A tag publishes the three
-# binaries as a release, which is where the download links on lynxby.com point.
+# Checking happens on every push and pull request. A tag publishes signed,
+# packaged builds as a release, which is where the download links on lynxby.com
+# point.
+#
+# Signing is optional: a missing secret skips that step with a warning, so
+# unsigned builds keep working. Secrets, all read in the build job:
+#   MACOS_CERT_P12, MACOS_CERT_PASSWORD   Developer ID Application .p12, base64
+#   MACOS_SIGN_IDENTITY                   optional, otherwise taken from the p12
+#   APPLE_ID, APPLE_TEAM_ID, APPLE_APP_PASSWORD   notarytool credentials
+#   WINDOWS_CERT_P12, WINDOWS_CERT_PASSWORD       code signing .pfx, base64
 
 on:
   push:
@@ -60,15 +68,22 @@ jobs:
           - platform: Linux x86_64
             os: ubuntu-latest
             artifact: lynxby-desktop-linux-x86_64
-            binary: lynxby-desktop
           - platform: Windows x86_64
             os: windows-latest
             artifact: lynxby-desktop-windows-x86_64
-            binary: lynxby-desktop.exe
           - platform: macOS arm64
             os: macos-latest
             artifact: lynxby-desktop-macos-arm64
-            binary: lynxby-desktop
+
+    env:
+      MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+      MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+      MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+      WINDOWS_CERT_P12: ${{ secrets.WINDOWS_CERT_P12 }}
+      WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
 
     steps:
       - uses: actions/checkout@v4
@@ -87,14 +102,180 @@ jobs:
       - name: Cache
         uses: Swatinem/rust-cache@v2
 
+      - name: Version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            version="${GITHUB_REF_NAME#v}"
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
       - name: Build
         run: cargo build --release -p lynxby-desktop
+
+      - name: Package the tarball
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp target/release/lynxby-desktop dist/lynxby-desktop-linux-x86_64
+          tar --owner=0 --group=0 -czf dist/lynxby-desktop-linux-x86_64.tar.gz \
+            -C target/release lynxby-desktop
+
+      - name: Bundle the app
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          app=Lynxby.app
+          mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+          cp target/release/lynxby-desktop "$app/Contents/MacOS/lynxby-desktop"
+          sed "s/__VERSION__/${VERSION}/" packaging/macos/Info.plist > "$app/Contents/Info.plist"
+          printf 'APPL????' > "$app/Contents/PkgInfo"
+
+      - name: Unsigned macOS build
+        if: runner.os == 'macOS' && env.MACOS_CERT_P12 == ''
+        run: echo "::warning title=Unsigned macOS build::MACOS_CERT_P12 is not set, so the disk image is not signed or notarised and Gatekeeper warns on first open."
+
+      - name: Import the Developer ID certificate
+        if: runner.os == 'macOS' && env.MACOS_CERT_P12 != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          keychain="$RUNNER_TEMP/lynxby-signing.keychain-db"
+          printf '%s' "$MACOS_CERT_P12" | openssl base64 -d -A > "$RUNNER_TEMP/certificate.p12"
+          security create-keychain -p actions "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p actions "$keychain"
+          security import "$RUNNER_TEMP/certificate.p12" -k "$keychain" \
+            -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k actions "$keychain" > /dev/null
+          security list-keychains -d user -s "$keychain" \
+            $(security list-keychains -d user | tr -d '"')
+          echo "MACOS_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+
+      - name: Sign the app
+        if: runner.os == 'macOS' && env.MACOS_CERT_P12 != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          identity="${MACOS_SIGN_IDENTITY:-}"
+          if [[ -z "$identity" ]]; then
+            identity=$(security find-identity -v -p codesigning "$MACOS_KEYCHAIN" |
+              sed -n 's/.*"\(Developer ID Application[^"]*\)".*/\1/p' | head -1)
+          fi
+          if [[ -z "$identity" ]]; then
+            echo "::error title=No signing identity::MACOS_CERT_P12 holds no Developer ID Application identity."
+            exit 1
+          fi
+          echo "MACOS_SIGN_IDENTITY=$identity" >> "$GITHUB_ENV"
+          codesign --force --options runtime --timestamp --keychain "$MACOS_KEYCHAIN" \
+            --sign "$identity" Lynxby.app/Contents/MacOS/lynxby-desktop
+          codesign --force --options runtime --timestamp --keychain "$MACOS_KEYCHAIN" \
+            --sign "$identity" Lynxby.app
+          codesign --verify --deep --strict --verbose=2 Lynxby.app
+
+      - name: Build the disk image
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist dmg
+          cp -R Lynxby.app dmg/
+          ln -s /Applications dmg/Applications
+          hdiutil create -volname Lynxby -srcfolder dmg -ov -format UDZO \
+            dist/lynxby-desktop-macos-arm64.dmg
+          if [[ -n "${MACOS_CERT_P12:-}" ]]; then
+            codesign --force --timestamp --keychain "$MACOS_KEYCHAIN" \
+              --sign "$MACOS_SIGN_IDENTITY" dist/lynxby-desktop-macos-arm64.dmg
+          fi
+
+      - name: Notarise and staple
+        if: runner.os == 'macOS' && env.MACOS_CERT_P12 != '' && env.APPLE_ID != '' && env.APPLE_TEAM_ID != '' && env.APPLE_APP_PASSWORD != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          dmg=dist/lynxby-desktop-macos-arm64.dmg
+          xcrun notarytool submit "$dmg" --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_APP_PASSWORD" --wait
+          xcrun stapler staple "$dmg"
+          xcrun stapler validate "$dmg"
+
+      - name: Unnotarised macOS build
+        if: runner.os == 'macOS' && env.MACOS_CERT_P12 != '' && (env.APPLE_ID == '' || env.APPLE_TEAM_ID == '' || env.APPLE_APP_PASSWORD == '')
+        run: echo "::warning title=Unnotarised macOS build::APPLE_ID, APPLE_TEAM_ID or APPLE_APP_PASSWORD is not set, so the signed disk image is not notarised and Gatekeeper warns on first open."
+
+      - name: Unsigned Windows build
+        if: runner.os == 'Windows' && env.WINDOWS_CERT_P12 == ''
+        run: echo "::warning title=Unsigned Windows build::WINDOWS_CERT_P12 is not set, so the executable and installer are unsigned and SmartScreen warns on first open."
+
+      - name: Import the Windows certificate
+        if: runner.os == 'Windows' && env.WINDOWS_CERT_P12 != ''
+        shell: pwsh
+        run: |
+          $path = Join-Path $env:RUNNER_TEMP 'codesign.pfx'
+          [IO.File]::WriteAllBytes($path, [Convert]::FromBase64String($env:WINDOWS_CERT_P12))
+          "WINDOWS_CERT_PATH=$path" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Sign the executable
+        if: runner.os == 'Windows' && env.WINDOWS_CERT_P12 != ''
+        shell: pwsh
+        run: |
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $signtool) { throw 'signtool.exe not found' }
+          & $signtool.FullName sign /fd SHA256 /f $env:WINDOWS_CERT_PATH /p $env:WINDOWS_CERT_PASSWORD `
+            /tr https://timestamp.digicert.com /td SHA256 target/release/lynxby-desktop.exe
+          if ($LASTEXITCODE -ne 0) { throw 'signing the executable failed' }
+          & $signtool.FullName verify /pa /v target/release/lynxby-desktop.exe
+          if ($LASTEXITCODE -ne 0) { throw 'verifying the executable failed' }
+
+      - name: Build the installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $makensis = (Get-Command makensis -ErrorAction SilentlyContinue).Source
+          if (-not $makensis) {
+            choco install nsis --no-progress -y
+            $makensis = 'C:\Program Files (x86)\NSIS\makensis.exe'
+          }
+          $parts = @((($env:VERSION -split '-')[0] -split '\.')) + @('0', '0', '0')
+          $four = ($parts[0..3]) -join '.'
+          New-Item -ItemType Directory -Force dist | Out-Null
+          & $makensis "/DVERSION=$env:VERSION" "/DPRODUCT_VERSION=$four" `
+            "/DSOURCE=$env:GITHUB_WORKSPACE\target\release\lynxby-desktop.exe" `
+            "/DOUTFILE=$env:GITHUB_WORKSPACE\dist\lynxby-desktop-windows-x86_64-setup.exe" `
+            packaging/windows/lynxby-desktop.nsi
+          if ($LASTEXITCODE -ne 0) { throw 'building the installer failed' }
+
+      - name: Sign the installer
+        if: runner.os == 'Windows' && env.WINDOWS_CERT_P12 != ''
+        shell: pwsh
+        run: |
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $signtool) { throw 'signtool.exe not found' }
+          & $signtool.FullName sign /fd SHA256 /f $env:WINDOWS_CERT_PATH /p $env:WINDOWS_CERT_PASSWORD `
+            /tr https://timestamp.digicert.com /td SHA256 dist/lynxby-desktop-windows-x86_64-setup.exe
+          if ($LASTEXITCODE -ne 0) { throw 'signing the installer failed' }
+
+      - name: Collect the assets
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/release/lynxby-desktop.exe dist/lynxby-desktop-windows-x86_64.exe
+          Get-ChildItem dist
 
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: target/release/${{ matrix.binary }}
+          path: dist/
           if-no-files-found: error
           retention-days: 30
 
@@ -107,23 +288,17 @@ jobs:
       contents: write
 
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Collect the binaries
+      - name: Collect the assets
         uses: actions/download-artifact@v4
         with:
-          path: dist
+          path: release
+          merge-multiple: true
 
-      - name: Name them per platform
+      - name: Checksums
         run: |
           set -euo pipefail
-          mkdir -p release
-          cp dist/lynxby-desktop-linux-x86_64/lynxby-desktop release/lynxby-desktop-linux-x86_64
-          cp dist/lynxby-desktop-windows-x86_64/lynxby-desktop.exe release/lynxby-desktop-windows-x86_64.exe
-          cp dist/lynxby-desktop-macos-arm64/lynxby-desktop release/lynxby-desktop-macos-arm64
-          chmod +x release/*
           (cd release && sha256sum ./* > SHA256SUMS)
-          ls -l release
+          cat release/SHA256SUMS
 
       - name: Publish
         env:
@@ -132,5 +307,5 @@ jobs:
           gh release create "$GITHUB_REF_NAME" release/* \
             --repo "$GITHUB_REPOSITORY" \
             --title "$GITHUB_REF_NAME" \
-            --notes "The Lynxby desktop app for Linux, Windows and macOS. Run the file; it asks you to sign in to your deployment in your browser. Builds are unsigned and there is no installer yet." \
+            --notes "The Lynxby desktop app: a tarball and a bare binary for Linux, an installer and a standalone executable for Windows, and a disk image for macOS. SHA256SUMS covers every asset. Run it; it asks you to sign in to your deployment in your browser." \
             --verify-tag

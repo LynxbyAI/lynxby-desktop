@@ -14,11 +14,25 @@ Builds for Linux, Windows and macOS are attached to every release:
 
 <https://github.com/LynxbyAI/lynxby-desktop/releases/latest>
 
-The file is the app: download the one for your platform and start it. On Linux and
-macOS, make it executable first (`chmod +x`). There is no installer, no code signing
-and no update feed yet, so macOS may block it the first time; allow it under
-System Settings › Privacy & Security. Each build prints its platform in
-the footer of the sign-in screen.
+| Platform | What to download |
+| --- | --- |
+| Linux x86_64 | `lynxby-desktop-linux-x86_64.tar.gz`, or the bare `lynxby-desktop-linux-x86_64` binary |
+| Windows x86_64 | `lynxby-desktop-windows-x86_64-setup.exe` for the installer, `lynxby-desktop-windows-x86_64.exe` to run without installing |
+| macOS arm64 | `lynxby-desktop-macos-arm64.dmg` |
+
+Every asset is listed in `SHA256SUMS`; check a download with
+`sha256sum -c SHA256SUMS` on Linux or `shasum -a 256 -c SHA256SUMS` on macOS.
+
+Linux: unpack the tarball or `chmod +x` the binary, then run it. macOS: open the
+disk image and drag Lynxby to Applications. Windows: run the setup, or the
+standalone executable.
+
+macOS builds are signed with a Developer ID certificate, notarised and stapled, so
+Gatekeeper lets them through. Windows builds carry a signature when the repository
+has a signing certificate, though SmartScreen can still warn until a download has
+reputation. A fork without the signing secrets still builds: the log shows a
+warning and the build is unsigned. Each build prints its platform in the footer of
+the sign-in screen.
 
 ## Run it
 
@@ -86,10 +100,17 @@ release build.
 ## Build and release
 
 - `build.yml` checks formatting, clippy and tests on every push and pull request.
-- The same workflow builds a release binary on Ubuntu, Windows and macOS, and
-  attaches one artifact per platform to the run.
-- Pushing a tag that starts with `v` publishes those three binaries as a release,
-  with a `SHA256SUMS` file next to them.
+- The same workflow builds and packages a release on Ubuntu, Windows and macOS:
+  a tarball and bare binary for Linux, a signed installer and standalone
+  executable for Windows, and a signed, notarised disk image for macOS.
+- Pushing a tag that starts with `v` publishes those packages as a release, with a
+  `SHA256SUMS` file next to them.
+- Signing reads its secrets from the repository: `MACOS_CERT_P12`,
+  `MACOS_CERT_PASSWORD` (a base64 Developer ID Application `.p12`),
+  `MACOS_SIGN_IDENTITY` (optional, otherwise read from the `.p12`), `APPLE_ID`,
+  `APPLE_TEAM_ID` and `APPLE_APP_PASSWORD` for macOS; `WINDOWS_CERT_P12` and
+  `WINDOWS_CERT_PASSWORD` (a base64 code signing `.pfx`) for Windows. A missing
+  secret skips that step with a warning, so unsigned builds keep working.
 
 ```sh
 git tag v0.1.0 && git push origin v0.1.0
@@ -134,4 +155,4 @@ and moved here when it started shipping as an app. The public API clients live i
 - Revoking the grant at the deployment when you sign out.
 - IME and clipboard paste in the composer.
 - Streaming cancellation and retry.
-- Installers and auto-update.
+- Auto-update.
