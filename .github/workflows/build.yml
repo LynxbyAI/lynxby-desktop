@@ -194,6 +194,13 @@ jobs:
               --sign "$MACOS_SIGN_IDENTITY" dist/lynxby-desktop-macos-arm64.dmg
           fi
 
+      - name: Stage the bare binary
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp Lynxby.app/Contents/MacOS/lynxby-desktop dist/lynxby-desktop-macos-arm64
+
       - name: Notarise and staple
         if: runner.os == 'macOS' && env.MACOS_CERT_P12 != '' && env.APPLE_ID != '' && env.APPLE_TEAM_ID != '' && env.APPLE_APP_PASSWORD != ''
         shell: bash
