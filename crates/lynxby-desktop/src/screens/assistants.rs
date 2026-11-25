@@ -1,6 +1,7 @@
 use gpui::*;
 
 use crate::app::{LynxbyApp, Notice};
+use crate::i18n::{t, tf, translate};
 use crate::theme;
 use crate::widgets;
 
@@ -19,7 +20,7 @@ pub fn render(app: &mut LynxbyApp, cx: &mut Context<LynxbyApp>) -> Div {
         let model = assistant
             .model
             .clone()
-            .unwrap_or_else(|| "routed by Lynxby".to_string());
+            .unwrap_or_else(|| t("routed by Lynxby").to_string());
         let id = assistant.id;
 
         cards = cards.child(
@@ -42,15 +43,22 @@ pub fn render(app: &mut LynxbyApp, cx: &mut Context<LynxbyApp>) -> Div {
                 }))
                 .child(
                     div()
-                        .text_lg()
-                        .font_weight(theme::SEMIBOLD)
-                        .child(assistant.name.clone()),
+                        .flex()
+                        .items_center()
+                        .gap_3()
+                        .child(widgets::avatar(&assistant.name, 36.))
+                        .child(
+                            div()
+                                .text_lg()
+                                .font_weight(theme::SEMIBOLD)
+                                .child(assistant.name.clone()),
+                        ),
                 )
                 .child(
                     div()
                         .text_sm()
                         .text_color(theme::text_muted())
-                        .child(assistant.role_label()),
+                        .child(translate(&assistant.role_label())),
                 )
                 .child(
                     div()
@@ -61,9 +69,9 @@ pub fn render(app: &mut LynxbyApp, cx: &mut Context<LynxbyApp>) -> Div {
     }
 
     let empty_message = if app.working() {
-        "Loading what your account may use…"
+        t("Loading what your account may use…")
     } else {
-        "You have access to no assistants yet. Ask an administrator for access."
+        t("You have access to no assistants yet. Ask an administrator for access.")
     };
 
     let empty = div()
@@ -82,7 +90,7 @@ pub fn render(app: &mut LynxbyApp, cx: &mut Context<LynxbyApp>) -> Div {
     };
 
     let tools_line = if tools.is_empty() {
-        "No tools are exposed to this account.".to_string()
+        t("No tools are exposed to this account.").to_string()
     } else {
         tools
     };
@@ -111,17 +119,15 @@ pub fn render(app: &mut LynxbyApp, cx: &mut Context<LynxbyApp>) -> Div {
                             div()
                                 .text_2xl()
                                 .font_weight(theme::SEMIBOLD)
-                                .child("Your assistants"),
+                                .child(t("Your assistants")),
                         )
-                        .child(
-                            div()
-                                .text_sm()
-                                .text_color(theme::text_subtle())
-                                .child(format!(
-                                "{assistant_count} available to you, served and enforced by {}.",
-                                app.config().host()
-                            )),
-                        )
+                        .child(div().text_sm().text_color(theme::text_subtle()).child(tf(
+                            "{count} available to you, served and enforced by {host}.",
+                            &[
+                                ("count", &assistant_count.to_string()),
+                                ("host", &app.config().host()),
+                            ],
+                        )))
                         .children(notice)
                         .child(if assistant_count == 0 { empty } else { cards })
                         .child(
@@ -132,7 +138,7 @@ pub fn render(app: &mut LynxbyApp, cx: &mut Context<LynxbyApp>) -> Div {
                                 .pt_4()
                                 .border_t_1()
                                 .border_color(theme::border())
-                                .child(widgets::label("TOOLS THIS ACCOUNT MAY CALL"))
+                                .child(widgets::label(t("TOOLS THIS ACCOUNT MAY CALL")))
                                 .child(
                                     div()
                                         .text_sm()
@@ -169,22 +175,22 @@ fn recent(app: &LynxbyApp, cx: &mut Context<LynxbyApp>) -> Div {
         .pt_4()
         .border_t_1()
         .border_color(theme::border())
-        .child(widgets::label("RECENT CONVERSATIONS"));
+        .child(widgets::label(t("RECENT CONVERSATIONS")));
 
     if rows.is_empty() {
         return block.child(div().text_xs().text_color(theme::text_subtle()).child(
             if app.working() {
-                "Loading what you talked about…"
+                t("Loading what you talked about…")
             } else {
-                "Nothing yet. Open an assistant to start."
+                t("Nothing yet. Open an assistant to start.")
             },
         ));
     }
 
     for (index, (conversation, assistant)) in rows.into_iter().enumerate() {
         let messages = match conversation.messages {
-            1 => "1 message".to_string(),
-            count => format!("{count} messages"),
+            1 => t("1 message").to_string(),
+            count => tf("{count} messages", &[("count", &count.to_string())]),
         };
 
         let seen = conversation.last_seen();
@@ -226,7 +232,7 @@ fn recent(app: &LynxbyApp, cx: &mut Context<LynxbyApp>) -> Div {
                         .text_sm()
                         .text_color(theme::text())
                         .whitespace_normal()
-                        .child(conversation.title_line()),
+                        .child(translate(&conversation.title_line())),
                 )
                 .child(
                     div()
@@ -244,7 +250,7 @@ fn header(app: &LynxbyApp, cx: &mut Context<LynxbyApp>) -> Div {
     let user = app
         .me()
         .map(|me| me.display_name())
-        .unwrap_or_else(|| "Signed in".to_string());
+        .unwrap_or_else(|| t("Signed in").to_string());
 
     let organisation = app
         .me()
@@ -293,10 +299,10 @@ fn header(app: &LynxbyApp, cx: &mut Context<LynxbyApp>) -> Div {
                         ),
                 )
                 .child(
-                    widgets::ghost_button("refresh", "Refresh")
+                    widgets::ghost_button("refresh", t("Refresh"))
                         .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| this.load(cx))),
                 )
-                .child(widgets::ghost_button("sign-out", "Sign out").on_click(
+                .child(widgets::ghost_button("sign-out", t("Sign out")).on_click(
                     cx.listener(|this, _: &ClickEvent, _window, _cx| this.sign_out(None)),
                 )),
         )

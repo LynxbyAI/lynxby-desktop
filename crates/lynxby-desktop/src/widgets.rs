@@ -1,7 +1,12 @@
 //! Small pieces every screen shares. Style only; behaviour stays with the
 //! screen that owns it.
 
+use std::sync::OnceLock;
+use std::time::Duration;
+
+use gpui::prelude::FluentBuilder;
 use gpui::*;
+use lynxby_client::markdown::{self, Block, Inline, Style};
 
 use crate::theme;
 
@@ -178,6 +183,30 @@ pub fn ghost_button(id: impl Into<ElementId>, label: impl IntoElement) -> Statef
         .child(label)
 }
 
+/// The assistant's initial on an accent disc, so its replies are easy to spot.
+pub fn avatar(name: &str, size: f32) -> Div {
+    let initial = name
+        .chars()
+        .find(|character| character.is_alphanumeric())
+        .map(|character| character.to_uppercase().to_string())
+        .unwrap_or_default();
+
+    div()
+        .flex_shrink_0()
+        .size(px(size))
+        .rounded_full()
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(theme::accent_surface())
+        .border_1()
+        .border_color(theme::accent())
+        .text_color(theme::accent_foreground())
+        .text_size(px(size * 0.45))
+        .font_weight(theme::SEMIBOLD)
+        .child(initial)
+}
+
 pub fn pill(label: impl Into<SharedString>, tint: Rgba) -> Div {
     div()
         .px_2()
@@ -229,6 +258,179 @@ pub fn info_box(message: impl Into<SharedString>) -> Div {
         .text_color(theme::text_subtle())
         .text_sm()
         .child(message.into())
+}
+
+/// Whether the desktop asked for less motion. GNOME's switch is read once;
+/// `LYNXBY_REDUCED_MOTION=1` forces it anywhere.
+///
+/// shortcut: macOS and Windows accessibility settings are not read yet; add
+/// them when GPUI exposes them.
+pub fn reduced_motion() -> bool {
+    static REDUCED: OnceLock<bool> = OnceLock::new();
+
+    *REDUCED.get_or_init(|| {
+        if std::env::var("LYNXBY_REDUCED_MOTION").is_ok_and(|value| value == "1") {
+            return true;
+        }
+
+        std::process::Command::new("gsettings")
+            .args(["get", "org.gnome.desktop.interface", "enable-animations"])
+            .output()
+            .is_ok_and(|output| String::from_utf8_lossy(&output.stdout).trim() == "false")
+    })
+}
+
+/// Three dots that rise in turn while the assistant is answering, the same
+/// rhythm as the embed widget. Still dots when motion is reduced.
+pub fn typing(id: impl Into<SharedString>) -> AnyElement {
+    let id = id.into();
+    let mut row = div().flex().items_center().gap(px(5.)).h(px(18.));
+
+    for index in 0..3 {
+        let dot = div()
+            .size(px(7.))
+            .rounded_full()
+            .bg(theme::text_muted())
+            .relative();
+
+        if reduced_motion() {
+            row = row.child(dot.opacity(0.55));
+            continue;
+        }
+
+        let offset = index as f32 * 0.125;
+        row = row.child(dot.with_animation(
+            SharedString::from(format!("{id}-{index}")),
+            Animation::new(Duration::from_millis(1200)).repeat(),
+            move |dot, delta| {
+                let phase = (delta - offset).rem_euclid(1.0);
+                // Up in the first quarter of the cycle, down in the second.
+                let lift = if phase < 0.25 {
+                    phase / 0.25
+                } else if phase < 0.5 {
+                    1.0 - (phase - 0.25) / 0.25
+                } else {
+                    0.0
+                };
+
+                dot.opacity(0.4 + 0.6 * lift).top(px(-3. * lift))
+            },
+        ));
+    }
+
+    row.into_any_element()
+}
+
+/// A new message settles into place once, the way the embed's bubbles do.
+pub fn fade_in(id: impl Into<ElementId>, element: Div) -> AnyElement {
+    if reduced_motion() {
+        return element.into_any_element();
+    }
+
+    element
+        .relative()
+        .with_animation(
+            id,
+            Animation::new(Duration::from_millis(180)).with_easing(ease_out_quint()),
+            |element, delta| element.opacity(delta).top(px(6. * (1. - delta))),
+        )
+        .into_any_element()
+}
+
+/// An answer's Markdown as blocks the eye can scan.
+pub fn markdown_view(source: &str) -> Div {
+    let mut column = div().flex().flex_col().gap_3().text_sm();
+
+    for block in markdown::parse(source) {
+        column = column.child(match block {
+            Block::Heading(level, text) => div()
+                .pt_1()
+                .font_weight(theme::SEMIBOLD)
+                .when(level <= 2, |heading| heading.text_base())
+                .child(styled(text)),
+            Block::Paragraph(text) => div().line_height(px(22.)).child(styled(text)),
+            Block::Quote(text) => div()
+                .pl_3()
+                .border_l_2()
+                .border_color(theme::border_strong())
+                .text_color(theme::text_muted())
+                .line_height(px(22.))
+                .child(styled(text)),
+            Block::List(items) => {
+                let mut list = div().flex().flex_col().gap_1();
+
+                for (marker, text) in items {
+                    list = list.child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .line_height(px(22.))
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .min_w(px(14.))
+                                    .text_color(theme::text_subtle())
+                                    .child(marker),
+                            )
+                            .child(div().flex_1().child(styled(text))),
+                    );
+                }
+
+                list
+            }
+            Block::Code(code) => div()
+                .p_3()
+                .rounded_lg()
+                .bg(theme::surface())
+                .border_1()
+                .border_color(theme::border())
+                .font_family("monospace")
+                .text_xs()
+                .line_height(px(18.))
+                .text_color(theme::text_muted())
+                .child(code),
+            Block::Rule => div().h(px(1.)).bg(theme::border()),
+        });
+    }
+
+    column
+}
+
+fn styled(text: Inline) -> StyledText {
+    let highlights = text
+        .spans
+        .into_iter()
+        .map(|(range, style)| {
+            let highlight = match style {
+                Style::Bold => HighlightStyle {
+                    font_weight: Some(theme::SEMIBOLD),
+                    ..HighlightStyle::default()
+                },
+                Style::Italic => HighlightStyle {
+                    font_style: Some(FontStyle::Italic),
+                    ..HighlightStyle::default()
+                },
+                Style::Code => HighlightStyle {
+                    background_color: Some(theme::surface().into()),
+                    color: Some(theme::accent_foreground().into()),
+                    ..HighlightStyle::default()
+                },
+                Style::Link => HighlightStyle {
+                    color: Some(theme::primary().into()),
+                    underline: Some(UnderlineStyle {
+                        thickness: px(1.),
+                        color: Some(theme::primary().into()),
+                        wavy: false,
+                    }),
+                    ..HighlightStyle::default()
+                },
+            };
+
+            (range, highlight)
+        })
+        .collect::<Vec<_>>();
+
+    StyledText::new(text.text).with_highlights(highlights)
 }
 
 #[cfg(test)]

@@ -1,6 +1,7 @@
 use gpui::*;
 
 use crate::app::{LynxbyApp, Notice};
+use crate::i18n::{t, tf};
 use crate::theme;
 use crate::widgets;
 
@@ -9,10 +10,10 @@ pub fn render(app: &mut LynxbyApp, cx: &mut Context<LynxbyApp>) -> Div {
 
     let status = match app.notice() {
         Some(Notice::Info(message)) => message.clone(),
-        _ => {
-            "A browser window opens on this machine and asks you to approve. Nothing is typed here."
-                .to_string()
-        }
+        _ => t(
+            "A browser window opens on this machine and asks you to approve. Nothing is typed here.",
+        )
+        .to_string(),
     };
 
     let error = match app.notice() {
@@ -21,18 +22,18 @@ pub fn render(app: &mut LynxbyApp, cx: &mut Context<LynxbyApp>) -> Div {
     };
 
     let button = if working {
-        widgets::primary_button("sign-in", "Continue in browser")
+        widgets::primary_button("sign-in", t("Continue in browser"))
             .w_full()
             .bg(theme::surface_sunken())
             .text_color(theme::text_subtle())
     } else {
-        widgets::primary_button("sign-in", "Continue in browser")
+        widgets::primary_button("sign-in", t("Continue in browser"))
             .w_full()
             .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| this.sign_in(cx)))
     };
 
     let cancel: AnyElement = if working {
-        widgets::ghost_button("cancel", "Cancel")
+        widgets::ghost_button("cancel", t("Cancel"))
             .w_full()
             .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| this.cancel_sign_in(cx)))
             .into_any_element()
@@ -65,7 +66,7 @@ pub fn render(app: &mut LynxbyApp, cx: &mut Context<LynxbyApp>) -> Div {
                     div()
                         .text_sm()
                         .text_color(theme::text_subtle())
-                        .child("Sign in to continue"),
+                        .child(t("Sign in to continue")),
                 ),
         )
         .child(
@@ -75,9 +76,9 @@ pub fn render(app: &mut LynxbyApp, cx: &mut Context<LynxbyApp>) -> Div {
                 .text_color(theme::text_muted())
                 .text_center()
                 .whitespace_normal()
-                .child(format!(
-                    "Your assistants, models and tools come from {}. Your password, second factor and single sign-on stay in your browser.",
-                    app.config().host()
+                .child(tf(
+                    "Your assistants, models and tools come from {host}. Your password, second factor and single sign-on stay in your browser.",
+                    &[("host", &app.config().host())],
                 )),
         )
         .children(

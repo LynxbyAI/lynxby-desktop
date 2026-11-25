@@ -4,6 +4,7 @@
 //! `LynxbyApp`, and every change goes through a method, so the flow
 //! splash → sign-in → assistants → chat is readable in one place.
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -13,13 +14,16 @@ use lynxby_client::api::ApiClient;
 use lynxby_client::composer::Composer;
 use lynxby_client::config::Config;
 use lynxby_client::error::Error;
+use lynxby_client::intake::{Answer, IntakeRun};
 use lynxby_client::signin;
 use lynxby_client::store::{Session, Store, StoredUser};
 use lynxby_client::types::{
-    Assistant, Citation, Conversation, Me, Reply, StoredMessage, StreamEvent, Tool,
+    Assistant, Citation, Conversation, Me, Reply, ShareDraft, StoredMessage, StreamEvent, Tool,
+    ToolCall,
 };
 use lynxby_client::{oauth, USER_AGENT};
 
+use crate::i18n::{self, t, tf};
 use crate::screens;
 use crate::theme;
 
@@ -54,8 +58,10 @@ pub struct Turn {
     pub user: String,
     pub answer: String,
     pub thinking: String,
-    pub tools: Vec<String>,
+    pub tools: Vec<ToolCall>,
     pub error: Option<String>,
+    /// The stored answer's id, which sharing needs. Known once the turn is done.
+    pub message_id: Option<i64>,
     pub model: Option<String>,
     /// What the turn used, in tokens. Money is the deployment's business, not
     /// the reader's: people buy tokens in advance and read them here.
@@ -73,10 +79,27 @@ pub struct Chat {
     pub loading: bool,
     /// A failure that belongs to the conversation itself, not to one answer.
     pub error: Option<String>,
+    /// The assistant's form, asked before the first message of a new chat.
+    pub intake: Option<IntakeRun>,
+    /// Set once the form's answers went out with the first message.
+    pub intake_sent: bool,
+    /// The choices ticked on a multiple-choice question, and the consent box.
+    pub selection: Vec<String>,
+    pub agreed: bool,
+    /// Turns whose tool calls are unfolded.
+    pub tools_open: HashSet<usize>,
+    /// A line about sharing, under the conversation.
+    pub note: Option<String>,
 }
 
 impl Chat {
     pub fn new(assistant: Assistant) -> Self {
+        let intake = assistant
+            .intake
+            .clone()
+            .filter(|form| !form.fields.is_empty())
+            .map(IntakeRun::new);
+
         Self {
             assistant,
             session_id: new_session_id(),
@@ -84,6 +107,86 @@ impl Chat {
             streaming: false,
             loading: false,
             error: None,
+            intake,
+            intake_sent: false,
+            selection: Vec::new(),
+            agreed: false,
+            tools_open: HashSet::new(),
+            note: None,
+        }
+    }
+
+    /// Whether the form still stands between the person and the composer.
+    pub fn asking(&self) -> bool {
+        self.intake.as_ref().is_some_and(|run| !run.is_done())
+    }
+
+    /// Whether the current question is answered by typing in the composer.
+    pub fn asking_text(&self) -> bool {
+        self.intake
+            .as_ref()
+            .and_then(IntakeRun::current)
+            .is_some_and(|field| {
+                !matches!(
+                    field.kind.as_str(),
+                    "single_choice" | "multiple_choice" | "consent"
+                )
+            })
+    }
+
+    /// Moves the form on with `answer`, and prepares the next question's
+    /// choices from what was said before, so Back shows the earlier pick.
+    pub fn answer_intake(&mut self, answer: Answer) -> bool {
+        let Some(run) = self.intake.as_mut() else {
+            return false;
+        };
+
+        let moved = run.answer(answer);
+        self.restore_selection();
+        moved
+    }
+
+    pub fn skip_intake(&mut self) {
+        if let Some(run) = self.intake.as_mut() {
+            run.skip();
+        }
+        self.restore_selection();
+    }
+
+    pub fn back_intake(&mut self) {
+        if let Some(run) = self.intake.as_mut() {
+            run.back();
+        }
+        self.restore_selection();
+    }
+
+    pub fn toggle_choice(&mut self, option: &str) {
+        if let Some(index) = self.selection.iter().position(|picked| picked == option) {
+            self.selection.remove(index);
+        } else {
+            self.selection.push(option.to_string());
+        }
+    }
+
+    fn restore_selection(&mut self) {
+        let answer = self
+            .intake
+            .as_ref()
+            .and_then(|run| run.current().and_then(|field| run.answer_of(&field.key)))
+            .cloned();
+
+        self.selection = match &answer {
+            Some(Answer::Choices(choices)) => choices.clone(),
+            _ => Vec::new(),
+        };
+        self.agreed = answer == Some(Answer::Agreed);
+    }
+
+    /// The answers to send with this message: once, with the first one.
+    pub fn intake_payload(&self) -> Option<serde_json::Value> {
+        match &self.intake {
+            Some(run) if run.is_done() && !self.intake_sent => Some(run.payload()),
+            _ => None,
         }
     }
 
@@ -95,12 +198,9 @@ impl Chat {
         messages: &[StoredMessage],
     ) -> Self {
         let mut chat = Self {
-            assistant,
             session_id,
-            turns: Vec::new(),
-            streaming: false,
-            loading: false,
-            error: None,
+            intake: None,
+            ..Self::new(assistant)
         };
 
         for message in messages {
@@ -115,6 +215,8 @@ impl Chat {
                     };
 
                     turn.answer = message.content.clone();
+                    turn.message_id = Some(message.id).filter(|id| *id > 0);
+                    turn.tools = message.tool_calls.clone();
                     turn.thinking = message.reasoning.clone().unwrap_or_default();
                     turn.citations = message.citations.clone();
                     turn.model = message.model.clone();
@@ -134,6 +236,7 @@ impl Chat {
         });
         self.streaming = true;
         self.error = None;
+        self.note = None;
     }
 
     fn current(&mut self) -> Option<&mut Turn> {
@@ -152,11 +255,12 @@ impl Chat {
                     turn.thinking.push_str(&delta);
                 }
             }
-            StreamEvent::Tool { label } => {
+            StreamEvent::Tool(call) => {
+                // Calls unfold while they arrive, as they do on the web.
+                let index = self.turns.len().saturating_sub(1);
                 if let Some(turn) = self.current() {
-                    if !turn.tools.contains(&label) {
-                        turn.tools.push(label);
-                    }
+                    turn.tools.push(*call);
+                    self.tools_open.insert(index);
                 }
             }
             StreamEvent::Delta { delta } => {
@@ -187,6 +291,10 @@ impl Chat {
             if !reply.citations.is_empty() {
                 turn.citations = reply.citations.clone();
             }
+            if turn.tools.is_empty() {
+                turn.tools = reply.tool_calls.clone();
+            }
+            turn.message_id = Some(reply.id).filter(|id| *id > 0);
             turn.tokens = token_total(reply.prompt_tokens, reply.completion_tokens);
         }
     }
@@ -299,6 +407,7 @@ impl LynxbyApp {
                 id: 3,
                 name: "Onboarding".to_string(),
                 role: Some("People ops".to_string()),
+                intake: Some(demo_form()),
                 ..Assistant::default()
             },
         ];
@@ -326,9 +435,9 @@ impl LynxbyApp {
 
             if kind == "login-waiting" {
                 self.working = true;
-                self.notice = Some(Notice::Info(format!(
-                    "Waiting for your browser on 127.0.0.1:{}. Approve there, then come back.",
-                    self.config.redirect_port
+                self.notice = Some(Notice::Info(tf(
+                    "Waiting for your browser on 127.0.0.1:{port}. Approve there, then come back.",
+                    &[("port", &self.config.redirect_port.to_string())],
                 )));
             }
 
@@ -337,23 +446,43 @@ impl LynxbyApp {
 
         self.screen = Screen::Assistants;
 
-        if kind == "chat" || kind == "chat-empty" {
+        if ["chat", "chat-empty", "chat-streaming", "chat-tools"].contains(&kind) {
             let mut chat = Chat::new(self.assistants[0].clone());
             chat.begin("What is the notice period in the supplier contract?".to_string());
             chat.apply(StreamEvent::Start {
                 model: Some("mistral-small".to_string()),
                 session_id: None,
             });
-            chat.apply(StreamEvent::Tool {
-                label: "search_knowledge".to_string(),
+            chat.apply(StreamEvent::Tool(Box::new(ToolCall {
+                name: "search_knowledge".to_string(),
+                ok: true,
+                status: Some(serde_json::json!(200)),
+                arguments: Some(serde_json::json!(
+                    r#"{"query":"supplier contract notice period"}"#
+                )),
+                result: Some(serde_json::json!(
+                    r#"{"body":{"hits":2,"documents":["Supplier agreement","Framework terms"]}}"#
+                )),
+                duration_ms: Some(184),
+            })));
+            chat.apply(StreamEvent::Tool(Box::new(ToolCall {
+                name: "crm_lookup_account".to_string(),
+                ok: false,
+                status: None,
+                arguments: Some(serde_json::json!(r#"{"account":"[ORGANISATION_1]"}"#)),
+                result: Some(serde_json::json!(
+                    "The CRM did not answer within 10 seconds."
+                )),
+                duration_ms: Some(10_004),
+            })));
+            chat.apply(StreamEvent::Delta {
+                delta: "The supplier contract sets a **notice period of 60 days**, counted from the first of the month.\n\n".to_string(),
             });
             chat.apply(StreamEvent::Delta {
-                delta: "The supplier contract sets a notice period of ".to_string(),
-            });
-            chat.apply(StreamEvent::Delta {
-                delta: "60 days, counted from the first of the month.".to_string(),
+                delta: "## What that means\n- Notice given on *14 March* takes effect on **1 June**.\n- Send it in writing; `clause 12.3` accepts email.\n\n> Either party may terminate with 60 days' notice.".to_string(),
             });
             chat.finish(&Reply {
+                id: 41,
                 content: String::new(),
                 model: Some("mistral-small".to_string()),
                 prompt_tokens: Some(1_200),
@@ -365,13 +494,45 @@ impl LynxbyApp {
                 }],
                 ..Reply::default()
             });
+            if kind != "chat-tools" {
+                chat.tools_open.clear();
+            }
+
+            if kind == "chat-streaming" {
+                chat.begin("And for the framework terms?".to_string());
+                chat.apply(StreamEvent::Start {
+                    model: Some("mistral-small".to_string()),
+                    session_id: None,
+                });
+            }
+
             self.chat = Some(chat);
             self.screen = Screen::Chat;
+        }
+
+        if kind == "intake" || kind == "intake-choice" {
+            let mut chat = Chat::new(self.assistants[2].clone());
+            chat.answer_intake(Answer::Text("Ada Lovelace".to_string()));
+
+            if kind == "intake-choice" {
+                chat.answer_intake(Answer::Text("ada@example.com".to_string()));
+                chat.toggle_choice("Laptop");
+                chat.toggle_choice("Phone");
+            }
+
+            self.chat = Some(chat);
+            self.screen = Screen::Chat;
+            self.composer
+                .insert(if kind == "intake" { "ada@exa" } else { "" });
+            self.scroll.scroll_to_bottom();
+            return;
         }
 
         if kind != "chat-empty" {
             self.composer.insert("Thank you.");
         }
+
+        self.scroll.scroll_to_bottom();
     }
 
     pub fn config(&self) -> &Config {
@@ -473,9 +634,9 @@ impl LynxbyApp {
 
         self.working = true;
         self.sign_in_cancel.store(false, Ordering::Relaxed);
-        self.notice = Some(Notice::Info(format!(
-            "Waiting for your browser on 127.0.0.1:{}. Approve there, then come back.",
-            self.config.redirect_port
+        self.notice = Some(Notice::Info(tf(
+            "Waiting for your browser on 127.0.0.1:{port}. Approve there, then come back.",
+            &[("port", &self.config.redirect_port.to_string())],
         )));
         cx.notify();
 
@@ -579,6 +740,9 @@ impl LynxbyApp {
         match result {
             Ok((me, assistants, tools, conversations)) => {
                 self.refresh_attempted = false;
+                if let Some(locale) = me.locale.as_deref() {
+                    i18n::set(locale);
+                }
                 self.remember_user(&me);
                 self.me = Some(me);
                 self.assistants = assistants;
@@ -595,7 +759,7 @@ impl LynxbyApp {
                 }
 
                 self.sign_out(Some(Notice::Info(
-                    "Your session ended. Sign in again.".to_string(),
+                    t("Your session ended. Sign in again.").to_string(),
                 )));
             }
             Err(error) if error.is_forbidden() => {
@@ -615,7 +779,7 @@ impl LynxbyApp {
         };
         let Some(refresh_token) = session.refresh_token.clone() else {
             self.sign_out(Some(Notice::Info(
-                "Your session ended. Sign in again.".to_string(),
+                t("Your session ended. Sign in again.").to_string(),
             )));
             return;
         };
@@ -653,7 +817,8 @@ impl LynxbyApp {
                     app.working = false;
                     let detail = error.to_string();
                     app.sign_out(Some(Notice::Info(format!(
-                        "Your session ended. Sign in again. ({detail})"
+                        "{} ({detail})",
+                        t("Your session ended. Sign in again.")
                     ))));
                 }
             })
@@ -706,7 +871,7 @@ impl LynxbyApp {
             .cloned()
         else {
             self.notice = Some(Notice::Info(
-                "That conversation's assistant is no longer available to you.".to_string(),
+                t("That conversation's assistant is no longer available to you.").to_string(),
             ));
             cx.notify();
 
@@ -718,6 +883,8 @@ impl LynxbyApp {
 
         let mut chat = Chat::new(assistant);
         chat.session_id = conversation.session_id.clone();
+        // The form belongs to a new conversation; this one already started.
+        chat.intake = None;
         chat.loading = fetching;
         self.chat = Some(chat);
         self.notice = None;
@@ -793,14 +960,138 @@ impl LynxbyApp {
 
     pub fn new_chat(&mut self, cx: &mut Context<Self>) {
         if let Some(chat) = self.chat.as_mut() {
-            chat.session_id = new_session_id();
-            chat.turns.clear();
-            chat.streaming = false;
-            chat.loading = false;
-            chat.error = None;
+            *chat = Chat::new(chat.assistant.clone());
         }
         self.composer.clear();
         cx.notify();
+    }
+
+    pub fn toggle_tools(&mut self, turn: usize, cx: &mut Context<Self>) {
+        if let Some(chat) = self.chat.as_mut() {
+            if !chat.tools_open.remove(&turn) {
+                chat.tools_open.insert(turn);
+            }
+        }
+        cx.notify();
+    }
+
+    pub fn intake_choose(&mut self, option: String, cx: &mut Context<Self>) {
+        if let Some(chat) = self.chat.as_mut() {
+            chat.answer_intake(Answer::Text(option));
+        }
+        self.after_intake_step(cx);
+    }
+
+    pub fn intake_toggle(&mut self, option: String, cx: &mut Context<Self>) {
+        if let Some(chat) = self.chat.as_mut() {
+            chat.toggle_choice(&option);
+        }
+        cx.notify();
+    }
+
+    pub fn intake_agree(&mut self, cx: &mut Context<Self>) {
+        if let Some(chat) = self.chat.as_mut() {
+            chat.agreed = !chat.agreed;
+        }
+        cx.notify();
+    }
+
+    /// Continue on a multiple-choice or consent question.
+    pub fn intake_continue(&mut self, cx: &mut Context<Self>) {
+        if let Some(chat) = self.chat.as_mut() {
+            let kind = chat
+                .intake
+                .as_ref()
+                .and_then(IntakeRun::current)
+                .map(|field| field.kind.clone());
+
+            let answer = match kind.as_deref() {
+                Some("consent") if chat.agreed => Answer::Agreed,
+                Some("consent") => Answer::Skipped,
+                _ => Answer::Choices(chat.selection.clone()),
+            };
+
+            chat.answer_intake(answer);
+        }
+        self.after_intake_step(cx);
+    }
+
+    pub fn intake_skip(&mut self, cx: &mut Context<Self>) {
+        if let Some(chat) = self.chat.as_mut() {
+            chat.skip_intake();
+        }
+        self.after_intake_step(cx);
+    }
+
+    pub fn intake_back(&mut self, cx: &mut Context<Self>) {
+        let previous = self.chat.as_mut().and_then(|chat| {
+            chat.back_intake();
+            let run = chat.intake.as_ref()?;
+            match run.current().and_then(|field| run.answer_of(&field.key)) {
+                Some(Answer::Text(text)) if chat.asking_text() => Some(text.clone()),
+                _ => None,
+            }
+        });
+
+        // A typed answer comes back into the box, to be corrected.
+        self.composer.clear();
+        if let Some(text) = previous {
+            self.composer.insert(&text);
+        }
+        self.after_intake_step(cx);
+    }
+
+    fn after_intake_step(&mut self, cx: &mut Context<Self>) {
+        self.scroll.scroll_to_bottom();
+        cx.notify();
+    }
+
+    /// Drafts a share of one answer and opens the draft in the browser, where
+    /// the person chooses who may see it and publishes it.
+    pub fn share(&mut self, turn: usize, cx: &mut Context<Self>) {
+        let Some(chat) = self.chat.as_mut() else {
+            return;
+        };
+        let Some(message_id) = chat.turns.get(turn).and_then(|turn| turn.message_id) else {
+            return;
+        };
+        let Some(session) = self.session.clone().filter(|_| !self.demo) else {
+            chat.note = Some(t("Open the draft in your browser to publish it. Nothing is reachable until you do.").to_string());
+            cx.notify();
+            return;
+        };
+
+        chat.note = Some(t("Opening the share draft…").to_string());
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let result: Result<ShareDraft, Error> = cx
+                .background_executor()
+                .spawn(async move {
+                    ApiClient::new(session.base_url, session.access_token).share(message_id)
+                })
+                .await;
+
+            this.update(cx, |app, cx| {
+                let note = match result {
+                    Ok(draft) => {
+                        cx.open_url(&draft.confirm_url);
+                        t("Open the draft in your browser to publish it. Nothing is reachable until you do.").to_string()
+                    }
+                    Err(error) => tf(
+                        "The share could not be made: {error}",
+                        &[("error", &error.to_string())],
+                    ),
+                };
+
+                if let Some(chat) = app.chat.as_mut() {
+                    chat.note = Some(note);
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     pub fn send(&mut self, cx: &mut Context<Self>) {
@@ -812,6 +1103,20 @@ impl LynxbyApp {
             return;
         }
 
+        if let Some(chat) = self.chat.as_mut() {
+            if chat.asking() {
+                if chat.asking_text() {
+                    let typed = self.composer.text().trim().to_string();
+                    if chat.answer_intake(Answer::Text(typed)) {
+                        self.composer.clear();
+                    }
+                    self.scroll.scroll_to_bottom();
+                    cx.notify();
+                }
+                return;
+            }
+        }
+
         let message = self.composer.take();
         if message.is_empty() {
             return;
@@ -819,6 +1124,7 @@ impl LynxbyApp {
 
         if self.demo {
             if let Some(chat) = self.chat.as_mut() {
+                chat.intake_sent |= chat.intake_payload().is_some();
                 chat.begin(message);
                 chat.apply(StreamEvent::Delta {
                     delta: "Sample answer: this build has no deployment behind it.".to_string(),
@@ -842,6 +1148,8 @@ impl LynxbyApp {
         chat.begin(message.clone());
         let assistant_id = chat.assistant.id;
         let session_id = chat.session_id.clone();
+        let intake = chat.intake_payload();
+        chat.intake_sent |= intake.is_some();
         self.scroll.scroll_to_bottom();
         cx.notify();
 
@@ -851,9 +1159,15 @@ impl LynxbyApp {
             .spawn(async move {
                 let api = ApiClient::new(session.base_url, session.access_token);
 
-                let result = api.stream_reply(assistant_id, &message, &session_id, &mut |event| {
-                    let _ = sender.send_blocking(StreamItem::Event(event));
-                });
+                let result = api.stream_reply(
+                    assistant_id,
+                    &message,
+                    &session_id,
+                    intake.as_ref(),
+                    &mut |event| {
+                        let _ = sender.send_blocking(StreamItem::Event(event));
+                    },
+                );
 
                 let _ = sender.send_blocking(StreamItem::Finished(result));
             })
@@ -894,12 +1208,17 @@ impl LynxbyApp {
                     }
                     Err(error) if error.is_unauthorized() => {
                         self.sign_out(Some(Notice::Info(
-                            "Your session ended. Sign in again.".to_string(),
+                            t("Your session ended. Sign in again.").to_string(),
                         )));
                     }
                     Err(error) => {
                         if let Some(chat) = self.chat.as_mut() {
                             chat.fail(error.to_string());
+                            // A 422 is refused before anything is stored, so the
+                            // form's answers go again with the next attempt.
+                            if error.status() == Some(422) && chat.turns.len() == 1 {
+                                chat.intake_sent = false;
+                            }
                         }
                     }
                 }
@@ -970,6 +1289,44 @@ impl Render for LynxbyApp {
     }
 }
 
+#[cfg(debug_assertions)]
+fn demo_form() -> lynxby_client::types::IntakeForm {
+    use lynxby_client::types::{IntakeField, IntakeForm};
+
+    let field = |key: &str, kind: &str, label: &str, required: bool| IntakeField {
+        key: key.to_string(),
+        kind: kind.to_string(),
+        label: label.to_string(),
+        required,
+        ..IntakeField::default()
+    };
+
+    IntakeForm {
+        fields: vec![
+            field("name", "single_line", "What is your name?", true),
+            IntakeField {
+                help: Some("We send the welcome pack here.".to_string()),
+                ..field("email", "email", "Which email address should we use?", true)
+            },
+            IntakeField {
+                options: vec!["Laptop".into(), "Phone".into(), "Second screen".into()],
+                ..field(
+                    "kit",
+                    "multiple_choice",
+                    "What do you need on day one?",
+                    false,
+                )
+            },
+            field(
+                "privacy",
+                "consent",
+                "May we keep these answers with the chat?",
+                true,
+            ),
+        ],
+    }
+}
+
 /// One round trip to the deployment, at sign-in and on every refresh.
 type Loaded = (Me, Vec<Assistant>, Vec<Tool>, Vec<Conversation>);
 
@@ -1006,7 +1363,10 @@ pub fn version_line() -> String {
 mod tests {
     use super::{token_total, Chat, Notice, Turn};
     use lynxby_client::error::Error;
-    use lynxby_client::types::{Assistant, Citation, Reply, StoredMessage, StreamEvent};
+    use lynxby_client::intake::Answer;
+    use lynxby_client::types::{
+        Assistant, Citation, IntakeField, IntakeForm, Reply, StoredMessage, StreamEvent, ToolCall,
+    };
 
     fn assistant() -> Assistant {
         Assistant {
@@ -1067,16 +1427,85 @@ mod tests {
         chat.apply(StreamEvent::Thinking {
             delta: "hmm".into(),
         });
-        chat.apply(StreamEvent::Tool {
-            label: "search_knowledge".into(),
-        });
-        chat.apply(StreamEvent::Tool {
-            label: "search_knowledge".into(),
-        });
+        for _ in 0..2 {
+            chat.apply(StreamEvent::Tool(Box::new(ToolCall {
+                name: "search_knowledge".into(),
+                ok: true,
+                ..ToolCall::default()
+            })));
+        }
 
         assert_eq!(chat.turns[0].thinking, "hmm");
         assert_eq!(chat.turns[0].answer, "");
-        assert_eq!(chat.turns[0].tools, vec!["search_knowledge"]);
+        // Two runs of the same tool are two calls, and they unfold as they arrive.
+        assert_eq!(chat.turns[0].tools.len(), 2);
+        assert!(chat.tools_open.contains(&0));
+    }
+
+    #[test]
+    fn a_stored_answer_brings_its_tool_calls_folded_and_its_id() {
+        let messages = vec![
+            stored("user", "Notice period?"),
+            StoredMessage {
+                id: 41,
+                tool_calls: vec![ToolCall {
+                    name: "search_knowledge".into(),
+                    ..ToolCall::default()
+                }],
+                ..stored("assistant", "60 days.")
+            },
+        ];
+
+        let chat = Chat::from_stored(assistant(), "s".to_string(), &messages);
+
+        assert_eq!(chat.turns[0].message_id, Some(41));
+        assert_eq!(chat.turns[0].tools[0].name, "search_knowledge");
+        assert!(chat.tools_open.is_empty());
+        assert!(chat.intake.is_none());
+    }
+
+    #[test]
+    fn the_form_comes_first_and_its_answers_go_with_the_first_message_once() {
+        let mut chat = Chat::new(Assistant {
+            intake: Some(IntakeForm {
+                fields: vec![
+                    IntakeField {
+                        key: "name".into(),
+                        kind: "single_line".into(),
+                        required: true,
+                        ..IntakeField::default()
+                    },
+                    IntakeField {
+                        key: "kit".into(),
+                        kind: "multiple_choice".into(),
+                        options: vec!["Laptop".into(), "Phone".into()],
+                        ..IntakeField::default()
+                    },
+                ],
+            }),
+            ..assistant()
+        });
+
+        assert!(chat.asking() && chat.asking_text());
+        assert_eq!(chat.intake_payload(), None);
+
+        chat.answer_intake(Answer::Text("Ada".into()));
+        assert!(chat.asking() && !chat.asking_text());
+
+        chat.toggle_choice("Phone");
+        chat.answer_intake(Answer::Choices(chat.selection.clone()));
+        assert!(!chat.asking());
+
+        chat.back_intake();
+        assert_eq!(chat.selection, vec!["Phone"], "Back shows the earlier pick");
+        chat.answer_intake(Answer::Choices(chat.selection.clone()));
+
+        assert_eq!(
+            chat.intake_payload(),
+            Some(serde_json::json!({"name": "Ada", "kit": ["Phone"]}))
+        );
+        chat.intake_sent = true;
+        assert_eq!(chat.intake_payload(), None);
     }
 
     #[test]

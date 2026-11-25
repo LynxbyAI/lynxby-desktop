@@ -73,4 +73,12 @@ pub fn danger_surface() -> Rgba {
     rgb(0x3c1d1b)
 }
 
+pub fn success() -> Rgba {
+    rgb(0x7fcaae)
+}
+
+pub fn accent_surface() -> Rgba {
+    rgb(0x3b2a20)
+}
+
 pub const SEMIBOLD: FontWeight = FontWeight::SEMIBOLD;

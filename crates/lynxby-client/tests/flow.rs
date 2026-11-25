@@ -212,7 +212,7 @@ fn a_streamed_answer_arrives_in_order_and_finishes_with_the_turn() {
 
     let mut events = Vec::new();
     let reply = ApiClient::new(&mock.base_url, "t")
-        .stream_reply(4, "Hi", "s", &mut |event| events.push(event))
+        .stream_reply(4, "Hi", "s", None, &mut |event| events.push(event))
         .unwrap();
 
     let request = mock.last();
@@ -231,7 +231,7 @@ fn a_streamed_answer_arrives_in_order_and_finishes_with_the_turn() {
         .map(|event| match event {
             StreamEvent::Start { .. } => "start".to_string(),
             StreamEvent::Thinking { .. } => "thinking".to_string(),
-            StreamEvent::Tool { label } => format!("tool:{label}"),
+            StreamEvent::Tool(call) => format!("tool:{}", call.name),
             StreamEvent::Delta { delta } => format!("delta:{delta}"),
             StreamEvent::Done(_) => "done".to_string(),
             other => format!("{other:?}"),
@@ -252,6 +252,69 @@ fn a_streamed_answer_arrives_in_order_and_finishes_with_the_turn() {
 }
 
 #[test]
+fn the_form_answers_go_with_the_first_message_only_when_given() {
+    let mock = Mock::start(|_| {
+        (
+            200,
+            "text/event-stream",
+            "event: done\ndata: {\"content\":\"ok\"}\n\n".to_string(),
+        )
+    });
+    let api = ApiClient::new(&mock.base_url, "t");
+
+    api.stream_reply(
+        1,
+        "Hi",
+        "s",
+        Some(&serde_json::json!({"topic": "Tax"})),
+        &mut |_| {},
+    )
+    .unwrap();
+    let first: serde_json::Value = serde_json::from_str(&mock.last().body).unwrap();
+
+    api.stream_reply(1, "Again", "s", None, &mut |_| {})
+        .unwrap();
+    let second: serde_json::Value = serde_json::from_str(&mock.last().body).unwrap();
+
+    assert_eq!(first["intake"]["topic"], "Tax");
+    assert!(second.get("intake").is_none());
+}
+
+#[test]
+fn sharing_an_answer_asks_for_a_draft_once() {
+    let mock = Mock::start(|_| {
+        (
+            201,
+            "application/json",
+            r#"{"id":7,"title":"Notice","state":"draft","confirm_url":"https://x.test/shared/drafts/7"}"#.to_string(),
+        )
+    });
+
+    let draft = ApiClient::new(&mock.base_url, "t").share(44).unwrap();
+    let request = mock.last();
+
+    assert_eq!(draft.confirm_url, "https://x.test/shared/drafts/7");
+    assert_eq!(request.method, "POST");
+    assert_eq!(request.url, "/api/v1/messages/44/share");
+    assert!(request.header("idempotency-key").is_some());
+}
+
+#[test]
+fn a_refused_share_reads_as_forbidden() {
+    let mock = Mock::start(|_| {
+        (
+            403,
+            "application/json",
+            r#"{"code":"sharing_disabled","message":"Sharing is turned off for this organisation."}"#.to_string(),
+        )
+    });
+
+    let error = ApiClient::new(&mock.base_url, "t").share(44).unwrap_err();
+
+    assert!(error.is_forbidden());
+}
+
+#[test]
 fn a_model_error_ends_the_stream_as_an_error() {
     let mock = Mock::start(|_| {
         (
@@ -264,7 +327,7 @@ fn a_model_error_ends_the_stream_as_an_error() {
 
     let mut seen = Vec::new();
     let error = ApiClient::new(&mock.base_url, "t")
-        .stream_reply(1, "Hi", "s", &mut |event| seen.push(event))
+        .stream_reply(1, "Hi", "s", None, &mut |event| seen.push(event))
         .unwrap_err();
 
     assert_eq!(error.code(), Some("model_error"));
@@ -283,7 +346,7 @@ fn a_stream_that_stops_early_is_a_protocol_error() {
     });
 
     let error = ApiClient::new(&mock.base_url, "t")
-        .stream_reply(1, "Hi", "s", &mut |_| {})
+        .stream_reply(1, "Hi", "s", None, &mut |_| {})
         .unwrap_err();
 
     assert!(error.to_string().contains("ended before it was finished"));
@@ -569,7 +632,7 @@ fn a_stream_split_across_packets_is_still_assembled() {
 
     let mut deltas = String::new();
     let reply = ApiClient::new(format!("http://127.0.0.1:{port}"), "t")
-        .stream_reply(1, "Hi", "s", &mut |event| {
+        .stream_reply(1, "Hi", "s", None, &mut |event| {
             if let StreamEvent::Delta { delta } = event {
                 deltas.push_str(&delta);
             }

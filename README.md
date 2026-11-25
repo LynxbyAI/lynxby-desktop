@@ -90,12 +90,23 @@ same as in the browser.
 ## Work on the screens without a deployment
 
 ```sh
-LYNXBY_DEMO=1 cargo run      # assistant list with sample data
-LYNXBY_DEMO=chat cargo run   # a finished conversation
+LYNXBY_DEMO=1 cargo run               # assistant list with sample data
+LYNXBY_DEMO=chat cargo run            # a finished conversation, tool calls folded
+LYNXBY_DEMO=chat-tools cargo run      # the same with the tool calls unfolded
+LYNXBY_DEMO=chat-streaming cargo run  # an answer still on its way
+LYNXBY_DEMO=intake cargo run          # an assistant's form, a typed question
+LYNXBY_DEMO=intake-choice cargo run   # the same form at a multiple-choice question
+LANG=nl_NL.UTF-8 LYNXBY_DEMO=1 cargo run  # in Dutch
 ```
 
 Debug builds only; nothing is sent anywhere, and the flag does nothing in a
 release build.
+
+The window speaks English or Dutch: the person's language from the deployment
+once signed in, the system's `LANG` before that. `LYNXBY_REDUCED_MOTION=1` turns
+the typing dots and fade-ins off where the GNOME setting is not available.
+Manrope ships in `crates/lynxby-desktop/assets/fonts` under the SIL Open Font
+License.
 
 ## Build and release
 

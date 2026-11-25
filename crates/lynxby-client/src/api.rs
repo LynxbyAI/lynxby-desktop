@@ -14,7 +14,7 @@ use crate::error::Error;
 use crate::http::agent;
 use crate::sse::{SseParser, Utf8Decoder};
 use crate::types::{
-    Assistant, AssistantPage, Conversation, ConversationPage, Me, MessagePage, Reply,
+    Assistant, AssistantPage, Conversation, ConversationPage, Me, MessagePage, Reply, ShareDraft,
     StoredMessage, StreamEvent, Tool, ToolList,
 };
 
@@ -139,8 +139,19 @@ impl ApiClient {
         assistant_id: i64,
         message: &str,
         session_id: &str,
+        intake: Option<&serde_json::Value>,
         on_event: &mut dyn FnMut(StreamEvent),
     ) -> Result<Reply, Error> {
+        let mut body = serde_json::json!({
+            "message": message,
+            "session_id": session_id,
+        });
+
+        // The form's answers travel once, with the first message of a session.
+        if let Some(intake) = intake {
+            body["intake"] = intake.clone();
+        }
+
         let response = self
             .agent
             .post(&format!(
@@ -150,10 +161,7 @@ impl ApiClient {
             .header("Authorization", format!("Bearer {}", self.token))
             .header("Accept", "text/event-stream")
             .header("Idempotency-Key", &idempotency_key())
-            .send_json(serde_json::json!({
-                "message": message,
-                "session_id": session_id,
-            }))
+            .send_json(body)
             .map_err(Error::from)?;
 
         let status = response.status().as_u16();
@@ -192,6 +200,24 @@ impl ApiClient {
         Err(Error::Protocol(
             "The answer ended before it was finished.".to_string(),
         ))
+    }
+
+    /// A draft share of one answer. The person publishes it in the browser,
+    /// on `confirm_url`; until then nothing is reachable.
+    pub fn share(&self, message_id: i64) -> Result<ShareDraft, Error> {
+        let response = self
+            .agent
+            .post(&format!(
+                "{}/api/v1/messages/{message_id}/share",
+                self.base_url
+            ))
+            .header("Authorization", format!("Bearer {}", self.token))
+            .header("Accept", "application/json")
+            .header("Idempotency-Key", &idempotency_key())
+            .send_json(serde_json::json!({}))
+            .map_err(Error::from)?;
+
+        self.decode(response)
     }
 
     fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T, Error> {

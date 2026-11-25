@@ -1,4 +1,5 @@
 mod app;
+mod i18n;
 mod screens;
 mod theme;
 mod widgets;
@@ -17,8 +18,22 @@ fn main() {
     };
 
     let store = Store::default_store();
+    i18n::set_from_system();
 
     Application::new().run(move |cx: &mut App| {
+        // The product font ships with the app (SIL OFL, see assets/fonts), so
+        // weights render on machines that do not have Manrope installed.
+        cx.text_system()
+            .add_fonts(vec![
+                include_bytes!("../assets/fonts/Manrope-Regular.ttf")
+                    .as_slice()
+                    .into(),
+                include_bytes!("../assets/fonts/Manrope-SemiBold.ttf")
+                    .as_slice()
+                    .into(),
+            ])
+            .expect("load the bundled Manrope font");
+
         let bounds = Bounds::centered(None, size(px(1120.), px(780.)), cx);
 
         let options = WindowOptions {
